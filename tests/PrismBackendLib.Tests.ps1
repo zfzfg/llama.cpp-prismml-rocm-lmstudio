@@ -93,6 +93,62 @@ $pwsh = (Get-Command pwsh).Source
 $started = Test-PrismServerVersion -ServerPath $pwsh
 Assert-True ($started.ServerStarted -and $started.ExitCode -eq 0 -and -not $started.InferenceTested) "a process that exits 0 is started, and inference is still not claimed"
 
+$helpOld = "--mmproj FILE`n-ngl, --gpu-layers N`n--load-mode MODE, --no-mmap"
+$helpNew = "$helpOld`n-lzm, --lazy-mode {on,off,auto}"
+Assert-True (-not (Test-PrismLazyModeContract -ManifestVersion "2.64.0" -HelpText $helpOld).Compatible) "server without --lazy-mode fails above the manifest threshold"
+Assert-True (Test-PrismLazyModeContract -ManifestVersion "2.41.0" -HelpText $helpNew).Compatible "server with --lazy-mode passes above the threshold"
+Assert-True (Test-PrismLazyModeContract -ManifestVersion "2.31.9" -HelpText $helpOld).Compatible "server without --lazy-mode passes below the threshold"
+Assert-True (-not (Test-PrismLazyModeContract -ManifestVersion "2.32.0" -HelpText $helpOld).Compatible) "the threshold version itself receives the flag"
+$flagCheck = Test-PrismFlagContract -Arguments @("--mmproj", "x", "--lazy-mode", "auto", "-ngl", "99") -HelpText $helpOld
+Assert-True ((-not $flagCheck.Compatible) -and ($flagCheck.UnknownFlags -join ",") -eq "--lazy-mode") "unknown flags are reported and values are ignored"
+Assert-True (Test-PrismFlagContract -Arguments @("--mmproj", "x") -HelpText $helpOld).Compatible "known flags pass"
+
+$newBuild = Set-PrismBuild -Build "b12128"
+Assert-True ($script:PrismEngineVulkan -eq "llama.cpp-win-x86_64-prism-vulkan-b12128") "b12128 registers a separate engine identity"
+Assert-True ($newBuild.VulkanZipUrl -like "*/prism-b12128-d7b2896/llama-prism-b12128-d7b2896-bin-win-vulkan-x64.zip") "b12128 Vulkan URL matches the release asset"
+Assert-True ($newBuild.HipDirName -eq "llama.cpp-prism-b12128-d7b2896-bin-win-hip-radeon-x64-lm-studio") "b12128 uses its own directory"
+Assert-True ($newBuild.HipSha256.Length -eq 64 -and $newBuild.VulkanSha256.Length -eq 64) "b12128 archives are pinned"
+$oldBuild = Set-PrismBuild -Build "b10809"
+Assert-True ($script:PrismEngineRocm -eq "llama.cpp-win-x86_64-prism-rocm-rx9070" -and $oldBuild.HipDirName -eq "llama.cpp-prism-b10809-b3ebc47-bin-win-hip-radeon-x64-lm-studio") "b10809 keeps its existing identity and directory"
+
+$cudaIndex = [pscustomobject]@{ json = @(
+    [pscustomobject]@{ dirPath = "C:\vk"; libLmStudioPath = "C:\vk\b.node"; launchInfo = [pscustomobject]@{ engineLibPath = "C:\vk\e.node" }; manifest = [pscustomobject]@{ name = "official-vulkan"; version = "1.0.0"; gpu = [pscustomobject]@{ framework = "Vulkan" } }; backendCompatibility = [pscustomobject]@{ status = "compatible" } },
+    [pscustomobject]@{ dirPath = "C:\cu"; libLmStudioPath = "C:\cu\b.node"; launchInfo = [pscustomobject]@{ engineLibPath = "C:\cu\e.node" }; manifest = [pscustomobject]@{ name = "official-cuda"; version = "1.0.0"; gpu = [pscustomobject]@{ framework = "CUDA"; make = "Nvidia" } }; backendCompatibility = [pscustomobject]@{ status = "compatible" } }
+) }
+$cudaUpdated = Update-PrismEngineIndex -Index $cudaIndex -Kinds @("cuda") -RocmDir "D:\r" -VulkanDir "D:\v" -CudaDir "D:\c"
+$cudaEntry = @($cudaUpdated.json | Where-Object { $_.manifest.name -eq $script:PrismEngineCuda })[0]
+Assert-True ($cudaEntry.dirPath -eq "D:\c" -and $cudaEntry.manifest.gpu.make -eq "Nvidia" -and $cudaEntry.manifest.gpu.framework -eq "CUDA") "cuda entry is built from a CUDA template"
+Assert-True ($cudaEntry.launchInfo.engineLibPath -like "*llm_engine_cuda12.node" -and $cudaEntry.libLmStudioPath -like "*liblmstudio_bindings_cuda12.node") "cuda entry points at the CUDA adapter"
+Assert-True ($cudaEntry.manifest.version -eq $script:PrismCudaManifestVersion) "cuda entry uses its own manifest version"
+Assert-True (@($cudaUpdated.json).Count -eq 3) "cuda update keeps the other entries"
+$metaIndex = '{"json":[{"dirPath":"C:\\a","libLmStudioPath":"x","launchInfo":{"engineLibPath":"y"},"manifest":{"name":"llama.cpp-win-x86_64-prism-cuda13-b12128","version":"1.0.0","gpu":{"framework":"CUDA"}},"backendCompatibility":{"status":"compatible"}},{"dirPath":"C:\\b","libLmStudioPath":"x","launchInfo":{"engineLibPath":"y"},"manifest":{"name":"official-cuda","version":"1.0.0","gpu":{"framework":"CUDA"}},"backendCompatibility":{"status":"compatible"}}],"meta":{"values":{"0.displayData":["map"],"1.displayData":["map"],"1.visibleDevicesConfig":["undefined"]},"other":1}}' | ConvertFrom-Json
+$metaUpdated = Update-PrismEngineIndex -Index $metaIndex -Kinds @("cuda") -RocmDir "D:\r" -VulkanDir "D:\v" -CudaDir "D:\c"
+$metaKeys = @($metaUpdated.meta.values.PSObject.Properties.Name)
+Assert-True ($metaUpdated.json[0].manifest.name -eq "official-cuda" -and $metaKeys -contains "0.visibleDevicesConfig") "index meta follows an entry that moved"
+Assert-True ($metaUpdated.json[1].manifest.name -eq $script:PrismEngineCuda -and $metaKeys -contains "1.displayData") "a new index entry gets the template meta"
+Assert-True ($metaKeys.Count -eq 3 -and $metaUpdated.meta.other -eq 1) "no stale index meta remains and other meta fields stay"
+
+$cudaPackage = Get-PrismCudaPackageJson
+$cudaManifest = $cudaPackage.Manifest | ConvertFrom-Json
+Assert-True ($cudaManifest.name -eq $script:PrismEngineCuda -and $cudaManifest.gpu.framework -eq "CUDA" -and $cudaManifest.target_libraries[0].name -eq "llm_engine_cuda12.node") "cuda manifest names the CUDA engine and adapter"
+$cudaDisplay = $cudaPackage.Display | ConvertFrom-Json -NoEnumerate
+Assert-True ($cudaPackage.Display.StartsWith('[["en",{') -and $cudaPackage.Display.EndsWith('}]]')) "cuda display data keeps the nested LM Studio shape"
+Assert-True (($cudaPackage.Artifacts | ConvertFrom-Json).files.Count -eq 9) "cuda artifacts list the runtime files"
+$cudaMissing = Join-Path $env:TEMP ("prism-cuda-" + [guid]::NewGuid().ToString("n"))
+Assert-True ((Get-PrismMissingFiles -Directory $cudaMissing -Kind "cuda") -contains "llm_engine_cuda12.node") "cuda checks its own adapter files"
+
+$v2 = (Merge-PrismGgufPreferenceV2 -ExistingJson '{"formatDefaults":{"gguf":"old","mlx":"keep"},"versions":{"old":"1.0.0"}}' -EngineName "new" -Version "2.0.0").Json | ConvertFrom-Json
+Assert-True ($v2.formatDefaults.gguf -eq "new" -and $v2.formatDefaults.mlx -eq "keep") "v2 preferences change only the GGUF default"
+Assert-True ($v2.versions.new -eq "2.0.0" -and $v2.versions.old -eq "1.0.0") "v2 preferences add the engine version and keep others"
+$v2Repair = (Merge-PrismGgufPreferenceV2 -ExistingJson '[{"model_format":"gguf","name":"old"}]' -EngineName "new" -Version "2.0.0").Json | ConvertFrom-Json
+Assert-True ($v2Repair.formatDefaults.gguf -eq "new") "v2 file with the old array shape becomes the v2 shape"
+
+$hashTemp = Join-Path $env:TEMP ("prism-hash-test-" + [guid]::NewGuid().ToString("n"))
+[System.IO.File]::WriteAllText($hashTemp, "abc")
+Assert-True (Test-PrismFileHash -Path $hashTemp -ExpectedSha256 "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD") "matching SHA-256 passes"
+Assert-True (-not (Test-PrismFileHash -Path $hashTemp -ExpectedSha256 ("0" * 64))) "wrong SHA-256 fails"
+Remove-Item -LiteralPath $hashTemp -Force
+
 if ($failures.Count -gt 0) {
     Write-Host "$($failures.Count) test(s) failed." -ForegroundColor Red
     exit 1

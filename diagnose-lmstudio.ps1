@@ -199,6 +199,32 @@ if (Test-Path $logPath) {
     Log-Line "Log file not found at $logPath"
 }
 
+# 5b. Flag contract between LM Studio and installed PrismML servers
+Log-Line "`n--- [5b] LM Studio Flag Contract ---"
+$serverLogs = Join-Path $env:USERPROFILE ".lmstudio\server-logs"
+if (Test-Path -LiteralPath $serverLogs) {
+    $flagErrors = Get-ChildItem -LiteralPath $serverLogs -Recurse -Filter "*.log" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 3 |
+        Select-String -Pattern "invalid argument: " -SimpleMatch | Select-Object -Last 5
+    foreach ($hit in $flagErrors) { Log-Line "  $($hit.Line)" }
+    if (-not $flagErrors) { Log-Line "  (No 'invalid argument' lines in the 3 newest server logs)" }
+}
+$backendsRoot = Join-Path $env:USERPROFILE ".lmstudio\extensions\backends"
+foreach ($dir in @(Get-ChildItem -LiteralPath $backendsRoot -Directory -Filter "llama.cpp-prism-*" -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch "\.bak-" })) {
+    $manifestFile = Join-Path $dir.FullName "backend-manifest.json"
+    $commonDll = Join-Path $dir.FullName "llama-common.dll"
+    if (-not (Test-Path -LiteralPath $manifestFile) -or -not (Test-Path -LiteralPath $commonDll)) { continue }
+    try {
+        $manifestVersion = (Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json).version
+        $receivesFlag = [version]$manifestVersion -ge [version]"2.32.0"
+        $acceptsFlag = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($commonDll)).Contains("--lazy-mode")
+        $state = if ($receivesFlag -and -not $acceptsFlag) { "MISMATCH: LLM models cannot load in LM Studio 0.4.28" } else { "ok" }
+        Log-Line "  $($dir.Name): manifest $manifestVersion, receives --lazy-mode=$receivesFlag, server has it=$acceptsFlag -> $state"
+    } catch {
+        Log-Line "  $($dir.Name): could not check: $($_.Exception.Message)"
+    }
+}
+
 # Optional Cache Clearing
 if ($ClearIndexCache) {
     Log-Line "`n--- [6] Clearing Cached Engine Index ---"

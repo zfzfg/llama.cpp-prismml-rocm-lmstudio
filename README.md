@@ -54,7 +54,7 @@ The installer adds backends next to the ones LM Studio already has. It does not 
 | :--- | :--- | :--- | :--- | :--- |
 | **AMD ROCm / HIP** | Windows x64 | **RX 9070 XT: tested by the maintainer in LM Studio.**<br>RX 9000 (`gfx1201` / `gfx1200`), RX 7000, and RX 6000 are the architectures this HIP build is expected to target. Those other cards were not tested here. | `prism-b10809` | **Included** |
 | **Vulkan** | Windows x64 | Expected to use the normal Windows driver on current AMD, Intel, and NVIDIA GPUs. Not a hardware test of every card. Polaris cards such as the RX 580 are outside the ROCm package. | `prism-b10809` | **Included** |
-| **CUDA 13.3** | Windows x64 | Expected for NVIDIA RTX 30 / 40 / 50 Series. Not tested in this packaging pass. | `prism-b10709` | Available in repository |
+| **CUDA 13.3** | Windows x64 | `prism-b12128` run directly on an RTX 5070 Ti with GLM-OCR and Bonsai. Other NVIDIA cards were not tested. | `prism-b12128` (installer), `prism-b10709` (repository) | **Included** |
 | **CPU / AVX2** | Windows x64 | Expected on modern x86_64 CPUs. Not tested in this packaging pass. | `prism-b10709` | Available in repository |
 
 ---
@@ -79,11 +79,13 @@ Install one backend only:
 .\setup-rocm-backend.ps1 -Backend vulkan
 ```
 
-With no `-Backend` value, an AMD GPU installs ROCm and Vulkan. A machine with only NVIDIA, or with no detected GPU, installs Vulkan only. `-Backend all` still stages the AMD package on an NVIDIA PC. The ROCm runtime does not drive an NVIDIA card. The CUDA build in this repository is not installed by this script.
+With no `-Backend` value, an AMD GPU installs ROCm and Vulkan, and a detected NVIDIA GPU installs PrismML CUDA 13.3 (`prism-b12128`). A machine with only NVIDIA installs CUDA only. A machine with no detected GPU installs Vulkan only. `-Backend cuda` installs CUDA without detection. `-Backend all` stages ROCm and Vulkan and does not add CUDA. The CUDA package needs an official LM Studio CUDA 12 runtime as its adapter source, and it downloads about 590 MB.
 
 `-SkipHardwareCheck` skips GPU detection and does not change `HSA_OVERRIDE_GFX_VERSION`. `-Force` recopies local binaries over an existing install, may replace an existing HSA value with `12.0.1` on an RX 9070 during a ROCm install, and writes LM Studio files even if the app is open. `-SetDefaultRuntime` is what changes the GGUF default. `-ClearHsaOverride` restores a previously recorded HSA value.
 
-A successful install means the staged files were complete and `llama-server.exe --version` exited 0. It does not mean a model was loaded. The published PrismML zip files do not ship a SHA-256 pin in this repository, so the installer checks the archive only by size and by the files it extracts. A failed update leaves the previous backend directory in place or restores it.
+`-PrismBuild b12128` installs the newer PrismML build next to the existing packages, with its own folder and engine identity. Its archives are checked against pinned SHA-256 values. ROCm and Vulkan stay on `b10809` by default because their `b12128` builds have not been run here. Only the CUDA `b12128` package was tested, with GLM-OCR and Bonsai in LM Studio 0.4.28 on an RTX 5070 Ti.
+
+A successful install means the staged files were complete and `llama-server.exe --version` exited 0. It does not mean a model was loaded. For the default `b10809` build, this repository has no SHA-256 pin, so the installer checks the archive only by size and by the files it extracts. A failed update leaves the previous backend directory in place or restores it.
 
 The first backup of a preference file, engine index, or replaced backend directory is `*.bak-prism-original` and is not overwritten. Later backups use a timestamp. Restore the original by moving that directory or file back yourself. Do not delete backups from other installs.
 
@@ -103,6 +105,8 @@ Run the installer logic tests with:
 ## Manual Installation
 
 ### 1. Copy to LM Studio Extensions
+A fresh clone holds only the JSON files for the `b10809` folders, because their binaries are not tracked. Run the installer, or unpack the release archive into the folder first.
+
 Copy the desired backend directory:
 - `llama.cpp-prism-b10809-b3ebc47-bin-win-hip-radeon-x64-lm-studio` (ROCm / HIP)
 - `llama.cpp-prism-b10809-b3ebc47-bin-win-vulkan-x64-lm-studio` (Vulkan)
@@ -156,6 +160,11 @@ If LM Studio outputs `No supported ROCm GPUs found` on a Radeon RX 9070 with a n
    - **Variable name**: `HSA_OVERRIDE_GFX_VERSION`
    - **Variable value**: `12.0.1`
 3. Click OK and restart LM Studio.
+
+### `error: invalid argument: --lazy-mode`
+LM Studio 0.4.28 passes `--lazy-mode` to every llama.cpp LLM engine with a manifest version of `2.32.0` or higher. The choice depends only on that version, not on the model. PrismML builds `b10709` and `b10809` do not know the flag, so LLM loads through them fail in LM Studio, while `llama-server.exe` started directly without the flag still works. `.\diagnose-lmstudio.ps1` reports this mismatch per installed package in section 5b. On an NVIDIA GPU, run `.\setup-rocm-backend.ps1 -SetDefaultRuntime` with LM Studio closed to install and select the CUDA `b12128` package.
+
+If GLM-OCR then reports `V Cache Quantization requires flash attention`, set V Cache Quantization to off in its load settings.
 
 ### Vulkan Fallback
 If your system encounters any ROCm driver conflicts on Windows, switch the Runtime in LM Studio to:

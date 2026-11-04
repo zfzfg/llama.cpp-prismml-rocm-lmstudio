@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Install PrismML AMD ROCm/HIP and Vulkan llama.cpp runtimes into LM Studio.
+    Install PrismML AMD ROCm/HIP, NVIDIA CUDA, and Vulkan llama.cpp runtimes into LM Studio.
 .DESCRIPTION
     Packaging fork by Collin Lerche (zfzfg) | STERRA (MIT).
     The llama.cpp binaries stay under the PrismML / ggml MIT license.
@@ -14,9 +14,12 @@
 
 [CmdletBinding()]
 param (
-    [ValidateSet("all", "rocm", "vulkan")]
+    [ValidateSet("all", "rocm", "vulkan", "cuda")]
     [string]$Backend = "all",
     
+    [ValidateSet("b10809", "b12128")]
+    [string]$PrismBuild = "b10809",
+
     [switch]$SkipHardwareCheck,
     [switch]$Force,
     [switch]$SetDefaultRuntime,
@@ -37,17 +40,18 @@ if (-not $prismLibPath) {
 . $prismLibPath
 
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "  PrismML LM Studio Extension Setup (AMD ROCm / Vulkan)   " -ForegroundColor Cyan
+Write-Host "  PrismML LM Studio Extension Setup (ROCm / CUDA / Vulkan)" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host ""
 
 # Constants
-$PrismTag = "prism-b10809-b3ebc47"
-$HipZipUrl = "https://github.com/PrismML-Eng/llama.cpp/releases/download/$PrismTag/llama-prism-b10809-b3ebc47-bin-win-hip-radeon-x64.zip"
-$VulkanZipUrl = "https://github.com/PrismML-Eng/llama.cpp/releases/download/$PrismTag/llama-prism-b10809-b3ebc47-bin-win-vulkan-x64.zip"
+$buildInfo = Set-PrismBuild -Build $PrismBuild
+$PrismTag = $buildInfo.Tag
+$HipZipUrl = $buildInfo.HipZipUrl
+$VulkanZipUrl = $buildInfo.VulkanZipUrl
 
-$HipDirName = "llama.cpp-prism-b10809-b3ebc47-bin-win-hip-radeon-x64-lm-studio"
-$VulkanDirName = "llama.cpp-prism-b10809-b3ebc47-bin-win-vulkan-x64-lm-studio"
+$HipDirName = $buildInfo.HipDirName
+$VulkanDirName = $buildInfo.VulkanDirName
 $lmsExePath = Join-Path $env:LOCALAPPDATA "Programs\LM Studio\resources\app\.webpack\lms.exe"
 
 # 1. Detect LM Studio extensions directory
@@ -103,7 +107,7 @@ if (-not $SkipHardwareCheck) {
         $detectedNvidia = @($gpus | Where-Object { $_.Caption -match "NVIDIA|GeForce|Quadro" })
         foreach ($nvidia in $detectedNvidia) {
             Write-Host "  [+] Found NVIDIA GPU: $($nvidia.Caption) (Driver: $($nvidia.DriverVersion))" -ForegroundColor Green
-            Write-Host "      The ROCm/HIP package does not drive this card. PrismML Vulkan does." -ForegroundColor Cyan
+            Write-Host "      The ROCm/HIP package does not drive this card. PrismML CUDA does." -ForegroundColor Cyan
         }
         
         if ($amds) {
@@ -163,13 +167,20 @@ if (-not $SkipHardwareCheck) {
 }
 
 $installBackend = $Backend
-if (-not $PSBoundParameters.ContainsKey("Backend") -and -not $SkipHardwareCheck -and $detectedAmd.Count -eq 0) {
-    $installBackend = "vulkan"
-    Write-Host "  [i] No AMD GPU was detected, so the default install is Vulkan only." -ForegroundColor Cyan
-    Write-Host "      Pass -Backend all or -Backend rocm to stage the AMD ROCm/HIP package anyway." -ForegroundColor Cyan
+$installCuda = ($Backend -eq "cuda")
+if (-not $PSBoundParameters.ContainsKey("Backend") -and -not $SkipHardwareCheck) {
     if ($detectedNvidia.Count -gt 0) {
-        Write-Host "      This script does not install the separate CUDA package." -ForegroundColor Cyan
+        $installCuda = $true
+        Write-Host "  [i] NVIDIA GPU detected, so PrismML CUDA ($($script:PrismCuda.Tag)) will be installed." -ForegroundColor Cyan
     }
+    if ($detectedAmd.Count -eq 0) {
+        $installBackend = if ($detectedNvidia.Count -gt 0) { "cuda" } else { "vulkan" }
+        Write-Host "  [i] No AMD GPU was detected, so the AMD ROCm/HIP package is skipped." -ForegroundColor Cyan
+        Write-Host "      Pass -Backend all or -Backend rocm to stage it anyway." -ForegroundColor Cyan
+    }
+}
+if ($installCuda -and $PSBoundParameters.ContainsKey("PrismBuild") -and $PrismBuild -ne "b12128") {
+    Write-Host "  [i] The CUDA package is only available as b12128. -PrismBuild applies to ROCm and Vulkan." -ForegroundColor Cyan
 }
 
 # Helper: Download file using curl if available or Invoke-WebRequest
@@ -190,7 +201,7 @@ function Download-FileWithProgress {
 $vendorVulkan = Join-Path $lmStudioBackendsPath "vendor\win-llama-vulkan-vendor-v3"
 $vulkanInstalled = Get-ChildItem -Path $lmStudioBackendsPath -Directory -Filter "llama.cpp-win-x86_64-vulkan*" -ErrorAction SilentlyContinue | Select-Object -First 1
 
-if (((-not (Test-Path $vendorVulkan)) -or (-not $vulkanInstalled)) -and (Test-Path $lmsExePath)) {
+if (($installBackend -ne "cuda") -and ((-not (Test-Path $vendorVulkan)) -or (-not $vulkanInstalled)) -and (Test-Path $lmsExePath)) {
     Write-Host "`n  [*] Ensuring official LM Studio Vulkan runtime package is installed..." -ForegroundColor Cyan
     try {
         & $lmsExePath runtime get -y llama.cpp:vulkan
@@ -201,25 +212,29 @@ if (((-not (Test-Path $vendorVulkan)) -or (-not $vulkanInstalled)) -and (Test-Pa
 
 # Helper: Find LM Studio adapter files
 function Get-LmStudioAdapterFiles {
-    param([string]$DestinationDir)
+    param([string]$DestinationDir, [string]$Kind = "vulkan")
     
-    $commonFiles = @(
-        "liblmstudio_bindings_vulkan.node", "llm_engine_vulkan.node",
+    $requiredAdapters = @(Get-PrismRequiredAdapterFiles -Kind $Kind)
+    $commonFiles = $requiredAdapters + @(
+        "libomp.dll",
         "llm_engine.dll", "lmstudiocore.dll", "ggml_llamacpp.dll",
         "MSVCP140.dll", "VCOMP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll"
     )
 
+    $adapterName = if ($Kind -eq "cuda") { "CUDA" } else { "Vulkan" }
+    $adapterRuntimeFilter = if ($Kind -eq "cuda") { "llama.cpp-win-x86_64-nvidia-cuda12*" } else { "llama.cpp-win-x86_64-vulkan*" }
+    $adapterRuntimeId = if ($Kind -eq "cuda") { "llama.cpp:cuda12" } else { "llama.cpp:vulkan" }
+
     function Test-AdapterSet([string]$Dir) {
-        foreach ($name in $script:PrismRequiredAdapterFiles) {
+        foreach ($name in $requiredAdapters) {
             if (-not (Test-Path -LiteralPath (Join-Path $Dir $name))) { return $false }
         }
         return $true
     }
     
-    # Only an official LM Studio Vulkan runtime is a valid adapter source.
-    # CUDA or CPU backends are not used, even when they contain llm_engine.dll.
-    $vulkanDirs = @(Get-ChildItem -Path $lmStudioBackendsPath -Directory -Filter "llama.cpp-win-x86_64-vulkan*" -ErrorAction SilentlyContinue |
-        Sort-Object -Property Name -Descending)
+    # Only an official LM Studio runtime of the same GPU framework is a valid adapter source.
+    $vulkanDirs = @(Get-ChildItem -Path $lmStudioBackendsPath -Directory -Filter $adapterRuntimeFilter -ErrorAction SilentlyContinue |
+        Sort-Object -Property { [version](($_.Name -split "-")[-1]) } -Descending)
     
     $source = $null
     foreach ($vDir in $vulkanDirs) {
@@ -230,7 +245,7 @@ function Get-LmStudioAdapterFiles {
     }
 
     if ($source) {
-        Write-Host "     Vulkan adapter source: $($source.FullName)" -ForegroundColor Gray
+        Write-Host "     $adapterName adapter source: $($source.FullName)" -ForegroundColor Gray
         foreach ($f in $commonFiles) {
             $src = Join-Path $source.FullName $f
             if (Test-Path -LiteralPath $src) {
@@ -257,9 +272,9 @@ function Get-LmStudioAdapterFiles {
             }
         }
     } elseif (Test-AdapterSet $DestinationDir) {
-        Write-Host "     Vulkan adapter source: files already present in the destination." -ForegroundColor Gray
+        Write-Host "     $adapterName adapter source: files already present in the destination." -ForegroundColor Gray
     } else {
-        throw "Required LM Studio Vulkan adapter files are missing ($($script:PrismRequiredAdapterFiles -join ', ')). Install the official Vulkan runtime with 'lms runtime get llama.cpp:vulkan' and rerun. This installer does not copy adapters from CUDA or CPU backends."
+        throw "Required LM Studio $adapterName adapter files are missing ($($requiredAdapters -join ', ')). Install the official $adapterName runtime with 'lms runtime get $adapterRuntimeId' and rerun. This installer does not copy adapters from other backends."
     }
 
     # Ensure aliases for node files exist
@@ -279,7 +294,7 @@ function Get-LmStudioAdapterFiles {
         Copy-Item $bindingNode $bindingVulkanNode -Force
     }
 
-    $stillMissing = @($script:PrismRequiredAdapterFiles | Where-Object {
+    $stillMissing = @($requiredAdapters | Where-Object {
         -not (Test-Path -LiteralPath (Join-Path $DestinationDir $_))
     })
     if ($stillMissing.Count -gt 0) {
@@ -291,8 +306,16 @@ function Get-LmStudioAdapterFiles {
 function Write-BackendManifests {
     param(
         [string]$TargetDir,
-        [string]$Kind # 'rocm' or 'vulkan'
+        [string]$Kind # 'rocm', 'vulkan', or 'cuda'
     )
+
+    if ($Kind -eq "cuda") {
+        $package = Get-PrismCudaPackageJson
+        [System.IO.File]::WriteAllText((Join-Path $TargetDir "backend-manifest.json"), $package.Manifest)
+        [System.IO.File]::WriteAllText((Join-Path $TargetDir "display-data.json"), $package.Display)
+        [System.IO.File]::WriteAllText((Join-Path $TargetDir "engine-protocol-server-artifacts.json"), $package.Artifacts)
+        return
+    }
     
     if ($Kind -eq "rocm") {
         $manifestJson = @'
@@ -435,6 +458,11 @@ function Write-BackendManifests {
 '@
     }
     
+    if ($buildInfo.Suffix) {
+        $manifestJson = $manifestJson.Replace('"llama.cpp-win-x86_64-prism-rocm-rx9070"', "`"$script:PrismEngineRocm`"").Replace('"llama.cpp-win-x86_64-prism-vulkan"', "`"$script:PrismEngineVulkan`"")
+        $displayJson = $displayJson.Replace('"displayName":"Prism ML ', "`"displayName`":`"Prism ML $PrismBuild ")
+    }
+
     [System.IO.File]::WriteAllText((Join-Path $TargetDir "backend-manifest.json"), $manifestJson)
     [System.IO.File]::WriteAllText((Join-Path $TargetDir "display-data.json"), $displayJson)
     [System.IO.File]::WriteAllText((Join-Path $TargetDir "engine-protocol-server-artifacts.json"), $artifactsJson)
@@ -464,6 +492,13 @@ function Complete-PrismStage {
     Write-Host "     $($version.Output)" -ForegroundColor Gray
     Write-Host "     Model inference tested: no. --version does not load a GGUF model." -ForegroundColor Gray
 
+    $stagedManifest = Get-Content -LiteralPath (Join-Path $Stage "backend-manifest.json") -Raw | ConvertFrom-Json
+    $help = Test-PrismServerVersion -ServerPath (Join-Path $Stage "llama-server.exe") -Argument "--help"
+    $contract = Test-PrismLazyModeContract -ManifestVersion $stagedManifest.version -HelpText ([string]$help.Output)
+    if (-not $contract.Compatible) {
+        Write-Host "     [!] LM Studio 0.4.28 passes --lazy-mode to manifest version $($stagedManifest.version), and this server rejects it. LLM models will not load there. Use -PrismBuild b12128." -ForegroundColor Yellow
+    }
+
     $movedAside = $null
     if (Test-Path -LiteralPath $Destination) {
         $original = Get-PrismOriginalBackupPath -Path $Destination
@@ -490,7 +525,10 @@ function Install-Backend {
         [string]$TargetName,
         [string]$ZipUrl,
         [string]$DisplayName,
-        [string]$Kind
+        [string]$Kind,
+        [string]$Sha256,
+        [string]$RuntimeZipUrl,
+        [string]$RuntimeSha256
     )
     
     $dest = Join-Path $lmStudioBackendsPath $TargetName
@@ -499,7 +537,7 @@ function Install-Backend {
     
     $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
     $localSource = Join-Path $scriptDir $TargetName
-    $marker = if ($Kind -eq "rocm") { "ggml-hip.dll" } else { "ggml-vulkan.dll" }
+    $marker = if ($Kind -eq "rocm") { "ggml-hip.dll" } elseif ($Kind -eq "cuda") { "ggml-cuda.dll" } else { "ggml-vulkan.dll" }
     $destHasServer = Test-Path (Join-Path $dest "llama-server.exe")
     $localHasServer = Test-Path (Join-Path $localSource "llama-server.exe")
 
@@ -527,13 +565,13 @@ function Install-Backend {
         Write-Host "     [Fast Path] Binaries already installed. Refreshing manifests in a staged copy..." -ForegroundColor Green
         Copy-PrismDirectory -Source $dest -Destination $stage
         Write-BackendManifests -TargetDir $stage -Kind $Kind
-        Get-LmStudioAdapterFiles -DestinationDir $stage
+        Get-LmStudioAdapterFiles -DestinationDir $stage -Kind $Kind
         Complete-PrismStage -Stage $stage -Destination $dest -Kind $Kind
     } elseif ($copyLocal) {
         Write-Host "     [Fast Path] Staging local repository files..." -ForegroundColor Green
         Copy-PrismDirectory -Source $localSource -Destination $stage
         Write-BackendManifests -TargetDir $stage -Kind $Kind
-        Get-LmStudioAdapterFiles -DestinationDir $stage
+        Get-LmStudioAdapterFiles -DestinationDir $stage -Kind $Kind
         Complete-PrismStage -Stage $stage -Destination $dest -Kind $Kind
     } else {
         # Standalone / Remote Path: Download from GitHub Release directly
@@ -541,13 +579,20 @@ function Install-Backend {
         $tempZip = Join-Path $env:TEMP "$TargetName.zip"
         
         try {
-            Download-FileWithProgress -Url $ZipUrl -OutputFile $tempZip -Desc "$DisplayName ($PrismTag)"
+            Download-FileWithProgress -Url $ZipUrl -OutputFile $tempZip -Desc $DisplayName
             $zipInfo = Get-Item -LiteralPath $tempZip
             if ($zipInfo.Length -lt 5MB) {
                 throw "Downloaded archive is only $($zipInfo.Length) bytes. Refusing to extract '$ZipUrl'."
             }
             
-            Write-Host "     No published SHA-256 is pinned for this PrismML archive. Size is only a sanity check, not an integrity proof." -ForegroundColor Yellow
+            if ($Sha256) {
+                if (-not (Test-PrismFileHash -Path $tempZip -ExpectedSha256 $Sha256)) {
+                    throw "SHA-256 of '$ZipUrl' does not match the pinned value. Refusing to extract it."
+                }
+                Write-Host "     SHA-256 matches the pinned release digest." -ForegroundColor Green
+            } else {
+                Write-Host "     No published SHA-256 is pinned for this PrismML archive. Size is only a sanity check, not an integrity proof." -ForegroundColor Yellow
+            }
             Write-Host "     Extracting archive to a temporary directory..." -ForegroundColor Cyan
             New-Item -ItemType Directory -Path $stage -Force | Out-Null
             
@@ -585,9 +630,23 @@ function Install-Backend {
                 Write-Host "     Added ggml-cpu.dll from ggml-cpu-x64.dll because it was missing." -ForegroundColor Gray
             }
             
+            if ($RuntimeZipUrl) {
+                $tempRuntimeZip = Join-Path $env:TEMP "$TargetName-runtime.zip"
+                try {
+                    Download-FileWithProgress -Url $RuntimeZipUrl -OutputFile $tempRuntimeZip -Desc "CUDA runtime libraries"
+                    if (-not (Test-PrismFileHash -Path $tempRuntimeZip -ExpectedSha256 $RuntimeSha256)) {
+                        throw "SHA-256 of '$RuntimeZipUrl' does not match the pinned value. Refusing to extract it."
+                    }
+                    Write-Host "     SHA-256 matches the pinned release digest." -ForegroundColor Green
+                    Expand-Archive -LiteralPath $tempRuntimeZip -DestinationPath $stage -Force
+                } finally {
+                    if (Test-Path -LiteralPath $tempRuntimeZip) { Remove-Item -LiteralPath $tempRuntimeZip -Force -ErrorAction SilentlyContinue }
+                }
+            }
+
             # Write Manifests directly
             Write-BackendManifests -TargetDir $stage -Kind $Kind
-            Get-LmStudioAdapterFiles -DestinationDir $stage
+            Get-LmStudioAdapterFiles -DestinationDir $stage -Kind $Kind
             Complete-PrismStage -Stage $stage -Destination $dest -Kind $Kind
         } finally {
             if (Test-Path $tempZip) { Remove-Item $tempZip -Force -ErrorAction SilentlyContinue }
@@ -612,7 +671,8 @@ if ($installBackend -eq "all" -or $installBackend -eq "rocm") {
     $installedHip = [bool](Install-Backend -TargetName $HipDirName `
         -ZipUrl $HipZipUrl `
         -DisplayName "PrismML AMD ROCm/HIP (Radeon RX 9070 XT / RDNA 4)" `
-        -Kind "rocm")
+        -Kind "rocm" `
+        -Sha256 $buildInfo.HipSha256)
     if (-not $installedHip) { $installFailed = $true }
 }
 
@@ -620,14 +680,29 @@ if ($installBackend -eq "all" -or $installBackend -eq "vulkan") {
     $installedVulkan = [bool](Install-Backend -TargetName $VulkanDirName `
         -ZipUrl $VulkanZipUrl `
         -DisplayName "PrismML Vulkan (Universal Fallback)" `
-        -Kind "vulkan")
+        -Kind "vulkan" `
+        -Sha256 $buildInfo.VulkanSha256)
     if (-not $installedVulkan) { $installFailed = $true }
 }
 
-$selectedEngine = if ($installedHip -or $installBackend -eq "rocm") {
-    "llama.cpp-win-x86_64-prism-rocm-rx9070"
+$installedCuda = $false
+if ($installCuda) {
+    $installedCuda = [bool](Install-Backend -TargetName $script:PrismCuda.DirName `
+        -ZipUrl $script:PrismCuda.ZipUrl `
+        -DisplayName "PrismML NVIDIA CUDA 13.3" `
+        -Kind "cuda" `
+        -Sha256 $script:PrismCuda.Sha256 `
+        -RuntimeZipUrl $script:PrismCuda.RuntimeZipUrl `
+        -RuntimeSha256 $script:PrismCuda.RuntimeSha256)
+    if (-not $installedCuda) { $installFailed = $true }
+}
+
+$selectedEngine = if ($installBackend -eq "cuda") {
+    $script:PrismEngineCuda
+} elseif ($installedHip -or $installBackend -eq "rocm") {
+    $script:PrismEngineRocm
 } else {
-    "llama.cpp-win-x86_64-prism-vulkan"
+    $script:PrismEngineVulkan
 }
 
 # 4. Configure LM Studio Engine Index and Runtime Preferences
@@ -641,6 +716,7 @@ $indexFiles = @(
 
 $prefFiles = @(
     (Join-Path $env:USERPROFILE ".lmstudio\.internal\backend-preferences-v1.json"),
+    (Join-Path $env:USERPROFILE ".lmstudio\.internal\backend-preferences-v2.json"),
     (Join-Path $env:USERPROFILE ".lmstudio\apps\bionic\.internal\backend-preferences-v1.json"),
     (Join-Path $env:USERPROFILE ".lmstudio\apps\bionic\.internal\backend-preferences-v2.json")
 )
@@ -653,7 +729,7 @@ if ($skipProfileWrites) {
 }
 
 function Set-PrismGgufPreference {
-    param([string]$Path, [string]$EngineName)
+    param([string]$Path, [string]$EngineName, [string]$Version)
     $parent = Split-Path $Path -Parent
     if (-not (Test-Path $parent)) { return }
     $existingJson = $null
@@ -661,7 +737,11 @@ function Set-PrismGgufPreference {
         $existingJson = Get-Content -LiteralPath $Path -Raw
     }
     try {
-        $merged = Merge-PrismGgufPreference -ExistingJson $existingJson -EngineName $EngineName
+        $merged = if ((Split-Path -Leaf $Path) -eq "backend-preferences-v2.json") {
+            Merge-PrismGgufPreferenceV2 -ExistingJson $existingJson -EngineName $EngineName -Version $Version
+        } else {
+            Merge-PrismGgufPreference -ExistingJson $existingJson -EngineName $EngineName -Version $Version
+        }
     } catch {
         Write-Host "  [!] $($_.Exception.Message)" -ForegroundColor Yellow
         Write-Host "      Left unchanged: $Path" -ForegroundColor Yellow
@@ -676,7 +756,7 @@ if ($SetDefaultRuntime -and -not $skipProfileWrites -and -not $installFailed) {
     Write-Host "  -SetDefaultRuntime: the GGUF default runtime will be set to $selectedEngine." -ForegroundColor Yellow
     foreach ($pf in $prefFiles) {
         if ((Test-Path (Split-Path $pf -Parent)) -or (Test-Path $pf)) {
-            Set-PrismGgufPreference -Path $pf -EngineName $selectedEngine
+            Set-PrismGgufPreference -Path $pf -EngineName $selectedEngine -Version $(if ($selectedEngine -eq $script:PrismEngineCuda) { $script:PrismCudaManifestVersion } else { $script:PrismPackageVersion })
         }
     }
 } elseif (-not $SetDefaultRuntime) {
@@ -705,10 +785,12 @@ foreach ($idx in $indexFiles) {
             $kinds = @()
             if ($installedVulkan) { $kinds += "vulkan" }
             if ($installedHip) { $kinds += "rocm" }
+            if ($installedCuda) { $kinds += "cuda" }
             if ($kinds.Count -eq 0) { continue }
             $updated = Update-PrismEngineIndex -Index $parsed -Kinds $kinds `
                 -RocmDir (Join-Path $lmStudioBackendsPath $HipDirName) `
-                -VulkanDir (Join-Path $lmStudioBackendsPath $VulkanDirName)
+                -VulkanDir (Join-Path $lmStudioBackendsPath $VulkanDirName) `
+                -CudaDir (Join-Path $lmStudioBackendsPath $script:PrismCuda.DirName)
             Write-PrismAtomicText -Path $idx -Text (ConvertTo-PrismJson -Value $updated)
             Write-Host "     [OK] Registered $($kinds -join ', ') in: $idx" -ForegroundColor Green
             Write-Host "          'compatible' here means registered for LM Studio, not that inference was tested." -ForegroundColor Gray
@@ -766,6 +848,9 @@ if ($installedHip) {
 }
 if ($installedVulkan) {
     Write-Host "   - PrismML Vulkan (fallback): installed" -ForegroundColor Green
+}
+if ($installedCuda) {
+    Write-Host "   - PrismML NVIDIA CUDA ($($script:PrismCuda.Tag)): installed" -ForegroundColor Green
 }
 if ($SetDefaultRuntime -and -not $installFailed) {
     Write-Host "   - GGUF default requested: $selectedEngine" -ForegroundColor Green
