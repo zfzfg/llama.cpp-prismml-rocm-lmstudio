@@ -37,7 +37,8 @@ $script:PrismLazyModeMinManifestVersion = "2.32.0"
 $script:PrismBuilds = @{
     b10809 = @{
         Tag = "prism-b10809-b3ebc47"; EngineSuffix = ""
-        HipSha256 = $null; VulkanSha256 = $null
+        HipSha256 = "96add5ac8da6f59f03815468466c2a0e845ac7f8f551aa28e7120f72b3b90559"
+        VulkanSha256 = "7ad6c5f9358a758d284392886834d761a1f2ebc0853ed4879d4a5d3dc861e797"
     }
     b12128 = @{
         Tag = "prism-b12128-d7b2896"; EngineSuffix = "-b12128"
@@ -476,9 +477,31 @@ function Write-PrismAtomicText {
     }
     $tmp = Join-Path $dir (".{0}.{1}.tmp" -f (Split-Path -Leaf $Path), [guid]::NewGuid().ToString("n"))
     $utf8 = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText($tmp, $Text, $utf8)
-    if (Test-Path -LiteralPath $Path) {
-        [System.IO.File]::Delete($Path)
+    try {
+        [System.IO.File]::WriteAllText($tmp, $Text, $utf8)
+        if (Test-Path -LiteralPath $Path) {
+            [System.IO.File]::Replace($tmp, $Path, [NullString]::Value)
+        } else {
+            [System.IO.File]::Move($tmp, $Path)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     }
-    [System.IO.File]::Move($tmp, $Path)
+}
+
+function Test-PrismDefaultRuntimeAllowed {
+    # A runtime that rejects --lazy-mode cannot load LLM models in LM Studio 0.4.28.
+    param(
+        [Parameter(Mandatory)][string]$Kind,
+        [AllowEmptyCollection()][string[]]$LazyModeIncompatibleKinds,
+        [switch]$Force
+    )
+    $Force -or ($LazyModeIncompatibleKinds -notcontains $Kind)
+}
+
+function Get-PrismVersionedDirectories {
+    # Skips names without a version suffix, which [version] would throw on.
+    param([AllowEmptyCollection()][object[]]$Directories)
+    @($Directories | Where-Object { $_.Name -match '-\d+(\.\d+){1,3}$' } |
+        Sort-Object -Property { [version](($_.Name -split "-")[-1]) } -Descending)
 }

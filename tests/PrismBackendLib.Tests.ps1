@@ -149,6 +149,28 @@ Assert-True (Test-PrismFileHash -Path $hashTemp -ExpectedSha256 "BA7816BF8F01CFE
 Assert-True (-not (Test-PrismFileHash -Path $hashTemp -ExpectedSha256 ("0" * 64))) "wrong SHA-256 fails"
 Remove-Item -LiteralPath $hashTemp -Force
 
+$atomicDir = Join-Path $env:TEMP ("prism-atomic-" + [guid]::NewGuid().ToString("n"))
+New-Item -ItemType Directory -Path $atomicDir | Out-Null
+$atomicFile = Join-Path $atomicDir "state.json"
+Write-PrismAtomicText -Path $atomicFile -Text "one"
+Write-PrismAtomicText -Path $atomicFile -Text "two"
+Assert-True ((Get-Content -LiteralPath $atomicFile -Raw) -eq "two") "atomic write replaces an existing file"
+Assert-True (@(Get-ChildItem -LiteralPath $atomicDir -Force -Filter "*.tmp").Count -eq 0) "atomic write leaves no temporary file"
+Remove-Item -LiteralPath $atomicDir -Recurse -Force
+
+Assert-True (-not (Test-PrismDefaultRuntimeAllowed -Kind "vulkan" -LazyModeIncompatibleKinds @("vulkan"))) "a runtime that rejects --lazy-mode is not selected"
+Assert-True (Test-PrismDefaultRuntimeAllowed -Kind "vulkan" -LazyModeIncompatibleKinds @("vulkan") -Force) "-Force selects it anyway"
+Assert-True (Test-PrismDefaultRuntimeAllowed -Kind "cuda" -LazyModeIncompatibleKinds @("vulkan")) "another incompatible runtime does not block selection"
+Assert-True (Test-PrismDefaultRuntimeAllowed -Kind "cuda" -LazyModeIncompatibleKinds @()) "no incompatible runtime allows selection"
+
+$sortedDirs = Get-PrismVersionedDirectories -Directories @(
+    [pscustomobject]@{ Name = "x-2.9.0" }, [pscustomobject]@{ Name = "x-2.10.0" }, [pscustomobject]@{ Name = "x-2.10.0.bak-prism-original" }
+)
+Assert-True ($sortedDirs.Count -eq 2 -and $sortedDirs[0].Name -eq "x-2.10.0") "directories sort by version and unversioned names are skipped"
+
+$pinned = Set-PrismBuild -Build "b10809"
+Assert-True ($pinned.HipSha256.Length -eq 64 -and $pinned.VulkanSha256.Length -eq 64) "b10809 archives are pinned"
+
 if ($failures.Count -gt 0) {
     Write-Host "$($failures.Count) test(s) failed." -ForegroundColor Red
     exit 1

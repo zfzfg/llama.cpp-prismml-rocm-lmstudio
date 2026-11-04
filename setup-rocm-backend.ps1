@@ -33,11 +33,14 @@ if ($PSScriptRoot) {
     if (Test-Path -LiteralPath $prismLibCandidate) { $prismLibPath = $prismLibCandidate }
 }
 if (-not $prismLibPath) {
-    $prismLibPath = Join-Path $env:TEMP "PrismBackendLib.ps1"
+    $prismLibDir = Join-Path $env:TEMP ("prism-lib-" + [guid]::NewGuid().ToString("n"))
+    New-Item -ItemType Directory -Path $prismLibDir | Out-Null
+    $prismLibPath = Join-Path $prismLibDir "PrismBackendLib.ps1"
     $prismLibUrl = "https://raw.githubusercontent.com/zfzfg/llama.cpp-prismml-rocm-lmstudio/main/PrismBackendLib.ps1"
     Invoke-WebRequest -Uri $prismLibUrl -OutFile $prismLibPath -UseBasicParsing
 }
 . $prismLibPath
+if ($prismLibDir) { Remove-Item -LiteralPath $prismLibDir -Recurse -Force -ErrorAction SilentlyContinue }
 
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "  PrismML LM Studio Extension Setup (ROCm / CUDA / Vulkan)" -ForegroundColor Cyan
@@ -189,7 +192,7 @@ function Download-FileWithProgress {
     Write-Host "     Downloading $Desc..." -ForegroundColor Cyan
     $curlPath = Get-Command "curl.exe" -ErrorAction SilentlyContinue
     if ($curlPath) {
-        & curl.exe -L --fail --progress-bar "$Url" -o "$OutputFile"
+        & curl.exe -L --fail --retry 3 --proto =https --progress-bar "$Url" -o "$OutputFile"
         if ($LASTEXITCODE -ne 0) { throw "Download failed for $Url (exit code $LASTEXITCODE)" }
     } else {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
@@ -233,8 +236,7 @@ function Get-LmStudioAdapterFiles {
     }
     
     # Only an official LM Studio runtime of the same GPU framework is a valid adapter source.
-    $vulkanDirs = @(Get-ChildItem -Path $lmStudioBackendsPath -Directory -Filter $adapterRuntimeFilter -ErrorAction SilentlyContinue |
-        Sort-Object -Property { [version](($_.Name -split "-")[-1]) } -Descending)
+    $vulkanDirs = Get-PrismVersionedDirectories -Directories @(Get-ChildItem -Path $lmStudioBackendsPath -Directory -Filter $adapterRuntimeFilter -ErrorAction SilentlyContinue)
     
     $source = $null
     foreach ($vDir in $vulkanDirs) {
@@ -496,6 +498,7 @@ function Complete-PrismStage {
     $help = Test-PrismServerVersion -ServerPath (Join-Path $Stage "llama-server.exe") -Argument "--help"
     $contract = Test-PrismLazyModeContract -ManifestVersion $stagedManifest.version -HelpText ([string]$help.Output)
     if (-not $contract.Compatible) {
+        $script:LazyModeIncompatibleKinds += $Kind
         Write-Host "     [!] LM Studio 0.4.28 passes --lazy-mode to manifest version $($stagedManifest.version), and this server rejects it. LLM models will not load there. Use -PrismBuild b12128." -ForegroundColor Yellow
     }
 
@@ -558,7 +561,8 @@ function Install-Backend {
     }
 
     $copyLocal = $localHasServer -and (-not $destHasServer -or $sourceNewer -or ($Force -and $destHasServer))
-    $stage = Join-Path $env:TEMP ("prism-stage-" + [guid]::NewGuid().ToString("n"))
+    # Same volume as the backends, so the final move is a rename. LM Studio does not scan this parent.
+    $stage = Join-Path (Split-Path -Parent $lmStudioBackendsPath) (".prism-stage-" + [guid]::NewGuid().ToString("n"))
 
     try {
     if ($destHasServer -and -not $copyLocal) {
@@ -664,6 +668,8 @@ function Install-Backend {
 Write-Host "`n[3/4] Installing Backends..." -ForegroundColor Yellow
 
 $installFailed = $false
+$script:ConfigFailed = $false
+$script:LazyModeIncompatibleKinds = @()
 $installedHip = $false
 $installedVulkan = $false
 
@@ -703,6 +709,12 @@ $selectedEngine = if ($installBackend -eq "cuda") {
     $script:PrismEngineRocm
 } else {
     $script:PrismEngineVulkan
+}
+$selectedKind = if ($selectedEngine -eq $script:PrismEngineCuda) { "cuda" } elseif ($selectedEngine -eq $script:PrismEngineRocm) { "rocm" } else { "vulkan" }
+$selectDefault = $SetDefaultRuntime -and (Test-PrismDefaultRuntimeAllowed -Kind $selectedKind -LazyModeIncompatibleKinds $script:LazyModeIncompatibleKinds -Force:$Force)
+if ($SetDefaultRuntime -and -not $selectDefault) {
+    Write-Host "  [!] $selectedEngine rejects --lazy-mode, so LM Studio 0.4.28 cannot load LLM models with it. It was not selected." -ForegroundColor Yellow
+    Write-Host "      Use -PrismBuild b12128, or pass -Force to select it anyway." -ForegroundColor Yellow
 }
 
 # 4. Configure LM Studio Engine Index and Runtime Preferences
@@ -745,6 +757,7 @@ function Set-PrismGgufPreference {
     } catch {
         Write-Host "  [!] $($_.Exception.Message)" -ForegroundColor Yellow
         Write-Host "      Left unchanged: $Path" -ForegroundColor Yellow
+        $script:ConfigFailed = $true
         return
     }
     Write-PrismAtomicText -Path $Path -Text $merged.Json
@@ -752,7 +765,7 @@ function Set-PrismGgufPreference {
     Write-Host "          Original, if one existed, is kept once at $(Get-PrismOriginalBackupPath -Path $Path)" -ForegroundColor Gray
 }
 
-if ($SetDefaultRuntime -and -not $skipProfileWrites -and -not $installFailed) {
+if ($selectDefault -and -not $skipProfileWrites -and -not $installFailed) {
     Write-Host "  -SetDefaultRuntime: the GGUF default runtime will be set to $selectedEngine." -ForegroundColor Yellow
     foreach ($pf in $prefFiles) {
         if ((Test-Path (Split-Path $pf -Parent)) -or (Test-Path $pf)) {
@@ -779,6 +792,7 @@ foreach ($idx in $indexFiles) {
             }
             if (-not $template) {
                 Write-Host "  [!] Engine index has no usable template. Leaving file unchanged: $idx" -ForegroundColor Yellow
+                $script:ConfigFailed = $true
                 continue
             }
 
@@ -798,17 +812,22 @@ foreach ($idx in $indexFiles) {
         } catch {
             Write-Host "  [!] Engine index was not modified: $idx" -ForegroundColor Yellow
             Write-Host "      $($_.Exception.Message)" -ForegroundColor Yellow
+            $script:ConfigFailed = $true
         }
     }
 }
 
 # Verify with LM Studio CLI
 if (Test-Path $lmsExePath) {
-    if ($SetDefaultRuntime -and -not $installFailed -and -not $skipProfileWrites) {
+    if ($selectDefault -and -not $installFailed -and -not $skipProfileWrites) {
         Write-Host "`nSelecting $selectedEngine via LM Studio CLI because -SetDefaultRuntime was set..." -ForegroundColor Gray
         try {
             & $lmsExePath runtime select $selectedEngine
-        } catch { }
+            if ($LASTEXITCODE -ne 0) { throw "lms runtime select exited with code $LASTEXITCODE" }
+        } catch {
+            Write-Host "  [!] $($_.Exception.Message)" -ForegroundColor Yellow
+            $script:ConfigFailed = $true
+        }
     }
     
     Write-Host "Verifying installed engines via 'lms runtime ls'..." -ForegroundColor Gray
@@ -830,12 +849,19 @@ if (Test-Path $lmsExePath) {
     Write-Host "LM Studio CLI not found at default location. Manual check in GUI required." -ForegroundColor Gray
 }
 
-if ($installFailed) {
+if ($installFailed -or $script:ConfigFailed) {
     Write-Host "`n==========================================================" -ForegroundColor Red
     Write-Host "              Installation finished with errors            " -ForegroundColor Red
     Write-Host "==========================================================" -ForegroundColor Red
-    Write-Host "A requested backend failed file validation or llama-server.exe --version. It was not selected as the default runtime." -ForegroundColor Red
-    exit 1
+    if ($installFailed) {
+        Write-Host "A requested backend failed file validation or llama-server.exe --version. It was not selected as the default runtime." -ForegroundColor Red
+    }
+    if ($script:ConfigFailed) {
+        Write-Host "The files are installed, but registering or selecting the runtime in LM Studio failed. See the messages above." -ForegroundColor Red
+    }
+    # 'exit' would close the user's PowerShell window when this runs through 'irm | iex'.
+    if ($PSCommandPath) { exit 1 }
+    throw "PrismML installation finished with errors."
 }
 
 Write-Host "`n==========================================================" -ForegroundColor Green
@@ -852,7 +878,7 @@ if ($installedVulkan) {
 if ($installedCuda) {
     Write-Host "   - PrismML NVIDIA CUDA ($($script:PrismCuda.Tag)): installed" -ForegroundColor Green
 }
-if ($SetDefaultRuntime -and -not $installFailed) {
+if ($selectDefault -and -not $installFailed) {
     Write-Host "   - GGUF default requested: $selectedEngine" -ForegroundColor Green
 } else {
     Write-Host "   - GGUF default runtime was not changed." -ForegroundColor Green

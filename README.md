@@ -1,7 +1,7 @@
-# PrismML llama.cpp for LM Studio (Windows packaging fork)
+# PrismML llama.cpp for LM Studio (Windows and Linux packaging fork)
 
 > [!IMPORTANT]
-> This repository is a **packaging fork**. It does not reimplement llama.cpp. It redistributes **pre-compiled PrismML `llama.cpp` runtimes** and adds Windows installer scripts, LM Studio manifests, and diagnostics so those runtimes can be selected inside **LM Studio**.
+> This repository is a **packaging fork**. It does not reimplement llama.cpp. It redistributes **pre-compiled PrismML `llama.cpp` runtimes** and adds installer scripts, LM Studio manifests, and diagnostics so those runtimes can be selected inside **LM Studio** on Windows. On Linux, an experimental installer adds the PrismML Vulkan runtime to **llmster**. See [Linux (llmster, Vulkan)](#linux-llmster-vulkan).
 >
 > Use it to **run PrismML Bonsai 1-bit / ternary GGUF models in LM Studio**, including `*-PQ2_0.gguf` and `*-Q2_0_g64.gguf`.
 >
@@ -13,10 +13,10 @@
 
 # LM Studio runtimes for AMD ROCm, Vulkan, CUDA, and CPU
 
-**Windows packages of the PrismML llama.cpp fork, with an LM Studio installer**
+**Windows packages of the PrismML llama.cpp fork with an LM Studio installer, plus Vulkan on Linux through llmster**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20x64-lightgrey.svg)](../../releases)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20x64%20%7C%20Linux%20x64-lightgrey.svg)](../../releases)
 [![Target](https://img.shields.io/badge/Target-LM%20Studio%20Extensions-purple.svg)](https://lmstudio.ai/)
 [![Hardware](https://img.shields.io/badge/Hardware-AMD%20Radeon%20%2F%20NVIDIA%20RTX-red.svg)](../../releases)
 
@@ -54,6 +54,7 @@ The installer adds backends next to the ones LM Studio already has. It does not 
 | :--- | :--- | :--- | :--- | :--- |
 | **AMD ROCm / HIP** | Windows x64 | **RX 9070 XT: tested by the maintainer in LM Studio.**<br>RX 9000 (`gfx1201` / `gfx1200`), RX 7000, and RX 6000 are the architectures this HIP build is expected to target. Those other cards were not tested here. | `prism-b10809` | **Included** |
 | **Vulkan** | Windows x64 | Expected to use the normal Windows driver on current AMD, Intel, and NVIDIA GPUs. Not a hardware test of every card. Polaris cards such as the RX 580 are outside the ROCm package. | `prism-b10809` | **Included** |
+| **Vulkan** | Linux x64 (llmster) | Tested on one RX 570 under Ubuntu 26.10. Uses undocumented llmster internals. | `prism-b12128` | **Experimental** |
 | **CUDA 13.3** | Windows x64 | `prism-b12128` run directly on an RTX 5070 Ti with GLM-OCR and Bonsai. Other NVIDIA cards were not tested. | `prism-b12128` (installer), `prism-b10709` (repository) | **Included** |
 | **CPU / AVX2** | Windows x64 | Expected on modern x86_64 CPUs. Not tested in this packaging pass. | `prism-b10709` | Available in repository |
 
@@ -85,7 +86,9 @@ With no `-Backend` value, an AMD GPU installs ROCm and Vulkan, and a detected NV
 
 `-PrismBuild b12128` installs the newer PrismML build next to the existing packages, with its own folder and engine identity. Its archives are checked against pinned SHA-256 values. ROCm and Vulkan stay on `b10809` by default because their `b12128` builds have not been run here. Only the CUDA `b12128` package was tested, with GLM-OCR and Bonsai in LM Studio 0.4.28 on an RTX 5070 Ti.
 
-A successful install means the staged files were complete and `llama-server.exe --version` exited 0. It does not mean a model was loaded. For the default `b10809` build, this repository has no SHA-256 pin, so the installer checks the archive only by size and by the files it extracts. A failed update leaves the previous backend directory in place or restores it.
+A successful install means the staged files were complete and `llama-server.exe --version` exited 0. It does not mean a model was loaded. Downloaded archives are checked against SHA-256 values pinned from the GitHub release data. A failed update leaves the previous backend directory in place or restores it. If registering or selecting the runtime in LM Studio fails, the installer reports an error even though the files are installed.
+
+`-SetDefaultRuntime` does not select a runtime that rejects `--lazy-mode`, because LM Studio 0.4.28 could not load LLM models with it. Pass `-Force` to select it anyway.
 
 The first backup of a preference file, engine index, or replaced backend directory is `*.bak-prism-original` and is not overwritten. Later backups use a timestamp. Restore the original by moving that directory or file back yourself. Do not delete backups from other installs.
 
@@ -99,6 +102,55 @@ Run the installer logic tests with:
 .\tests\PrismBackendLib.Tests.ps1
 ```
 
+
+---
+
+## Linux (llmster, Vulkan)
+
+`install-linux-llmster.sh` adds PrismML `b12128` over Vulkan to [llmster](https://lmstudio.ai/) as an extra runtime. It is experimental, because custom runtimes are not a documented llmster feature, and a llmster update can break it. This repository does not offer ROCm on Polaris cards such as the RX 570.
+
+You need x86_64 Linux, llmster, its official Vulkan runtime (`lms runtime get`), and `python3`, `curl`, `tar`, `sha256sum`, `flock`, and `timeout`. Run the script as the user who owns llmster, not as root.
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/zfzfg/llama.cpp-prismml-rocm-lmstudio/main/install-linux-llmster.sh
+less install-linux-llmster.sh
+bash install-linux-llmster.sh install
+```
+
+To remove the runtime and select the official Vulkan runtime again:
+
+```bash
+bash install-linux-llmster.sh uninstall
+```
+
+Both commands restart the llmster daemon, so its API is briefly unavailable. They refuse to run while a model is loaded. `--force` runs anyway and unloads the model.
+
+The installer adds its own folder under `~/.lmstudio/extensions/backends`, edits `internal-engine-index.json`, and selects the runtime. The first version of the index and preference files is kept as `*.bak-prism-original` in `~/.lmstudio/.internal`. If a step fails after the daemon has stopped, the installer restores the previous files and starts the daemon again.
+
+**Tested** on one RX 570 with Ubuntu 26.10, kernel 7.3, and llmster 0.0.27:
+
+* GLM-OCR through llmster returned the reference text exactly, across 10 of 10 load and unload cycles.
+* Bonsai 2-9B PQ2_0 returned the correct answer, both directly and through llmster.
+
+One direct `llama-server` run with Bonsai 2-9B PQ2_0 and 2,476 prompt tokens measured the following. It is a single run, not a benchmark.
+
+| Backend | Prompt (t/s) | Generation (t/s) |
+| :--- | ---: | ---: |
+| Vulkan | 187.1 | 20.2 |
+| CPU, 14 threads | 23.6 | 10.5 |
+
+**Not tested or still open:**
+
+* No long-running stability test has been done.
+* Other GPUs and distributions have not been tried.
+* The thinking phase of one Bonsai run through llmster contained an unexplained `391.cw`. The final answer was correct.
+* The test card's memory is unclear: the kernel reports 8 GB, while its PCI ID says 4 GB.
+
+Run the installer tests with the pinned release archive. They use a temporary `LMS_HOME` and a stub `lms`:
+
+```bash
+tests/install-linux-llmster.test.sh /path/to/llama-prism-b12128-d7b2896-bin-ubuntu-vulkan-x64.tar.gz
+```
 
 ---
 
